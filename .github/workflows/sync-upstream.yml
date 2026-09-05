@@ -1,0 +1,109 @@
+name: Sync Upstream Release
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Find latest upstream stable release
+        id: upstream
+        env:
+          UPSTREAM_REPOSITORY: Wei-Shaw/sub2api
+        run: |
+          tag=$(curl --fail --retry 3 --silent --show-error \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/latest" | jq -r '.tag_name')
+          test -n "$tag"
+          test "$tag" != "null"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Stop when already synchronized
+        id: current
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          current=$(tr -d '[:space:]' < UPSTREAM_BASE)
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          test "$current" = "$UPSTREAM_TAG" && echo "already_current=true" >> "$GITHUB_OUTPUT" || true
+
+      - name: Merge upstream release
+        if: steps.current.outputs.already_current != 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          git remote add upstream https://github.com/Wei-Shaw/sub2api.git 2>/dev/null || git remote set-url upstream https://github.com/Wei-Shaw/sub2api.git
+          git fetch upstream "refs/tags/${UPSTREAM_TAG}:refs/tags/upstream/${UPSTREAM_TAG}"
+          git switch -c "sync/${UPSTREAM_TAG}-${GITHUB_RUN_ID}"
+          git merge --no-edit "upstream/${UPSTREAM_TAG}"
+          printf '%s\n' "$UPSTREAM_TAG" > UPSTREAM_BASE
+
+      - name: Set up pnpm
+        if: steps.current.outputs.already_current != 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        if: steps.current.outputs.already_current != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Build frontend assets
+        if: steps.current.outputs.already_current != 'true'
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Set up Go
+        if: steps.current.outputs.already_current != 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify custom patches
+        if: steps.current.outputs.already_current != 'true'
+        working-directory: backend
+        run: |
+          go test ./internal/handler ./internal/service
+          go build -buildvcs=false -o /tmp/sub2api-server -tags embed ./cmd/server
+          git -C .. diff --check
+
+      - name: Create synchronization pull request
+        if: steps.current.outputs.already_current != 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: sync/${{ steps.upstream.outputs.tag }}
+          delete-branch: true
+          title: 'chore: sync upstream ${{ steps.upstream.outputs.tag }}'
+          commit-message: 'chore: record upstream ${{ steps.upstream.outputs.tag }}'
+          body: |
+            同步官方 Release `${{ steps.upstream.outputs.tag }}`。
+
+            已运行：
+            - `go test ./internal/handler ./internal/service`
+            - `go build -tags embed ./cmd/server`
+
+            两项本地定制保留在现有提交中：API Key Codex 本地模型目录与模型目录错误脱敏。

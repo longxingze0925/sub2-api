@@ -1,0 +1,249 @@
+From fee25ade262815bf36d1318636eefd2854baebef Mon Sep 17 00:00:00 2001
+From: longxingze0925 <longxingze0925@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 16:43:52 +0800
+Subject: [PATCH 2/2] fix(codex): sanitize upstream model errors
+
+
+diff --git a/backend/internal/handler/openai_codex_models_handler.go b/backend/internal/handler/openai_codex_models_handler.go
+index 3a38ce515..f2547587b 100644
+--- a/backend/internal/handler/openai_codex_models_handler.go
++++ b/backend/internal/handler/openai_codex_models_handler.go
+@@ -5,7 +5,6 @@ import (
+ 
+ 	"github.com/gin-gonic/gin"
+ 
+-	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+ 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
+ 	"github.com/Wei-Shaw/sub2api/internal/service"
+ )
+@@ -65,7 +64,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
+ 				return
+ 			}
+ 			if lastUpstreamErr != nil {
+-				h.errorResponse(c, infraerrors.Code(lastUpstreamErr), "upstream_error", infraerrors.Message(lastUpstreamErr))
++				h.codexModelsUpstreamErrorResponse(c, lastUpstreamErr)
+ 				return
+ 			}
+ 			h.errorResponse(c, http.StatusServiceUnavailable, "upstream_error", "No available OpenAI accounts")
+@@ -87,7 +86,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
+ 				lastUpstreamErr = err
+ 				continue
+ 			}
+-			h.errorResponse(c, infraerrors.Code(err), "upstream_error", infraerrors.Message(err))
++			h.codexModelsUpstreamErrorResponse(c, err)
+ 			return
+ 		}
+ 		if err := h.gatewayService.CompleteAPIKeyCodexModelsManifestForClient(manifest, account); err != nil {
+@@ -107,6 +106,11 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
+ 	}
+ }
+ 
++func (h *OpenAIGatewayHandler) codexModelsUpstreamErrorResponse(c *gin.Context, err error) {
++	statusCode, message := service.CodexModelsManifestClientError(err)
++	h.errorResponse(c, statusCode, "upstream_error", message)
++}
++
+ func writeCodexModelsManifestResponse(c *gin.Context, manifest *service.CodexModelsManifest) {
+ 	if manifest.ETag != "" {
+ 		c.Header("ETag", manifest.ETag)
+diff --git a/backend/internal/handler/openai_codex_models_handler_test.go b/backend/internal/handler/openai_codex_models_handler_test.go
+index bb451380e..2ecdaf3e6 100644
+--- a/backend/internal/handler/openai_codex_models_handler_test.go
++++ b/backend/internal/handler/openai_codex_models_handler_test.go
+@@ -78,9 +78,14 @@ func (u *codexModelsFailoverHTTPUpstream) Do(_ *http.Request, _ string, accountI
+ 			return nil, u.firstErr
+ 		}
+ 		if u.firstBody != "" && !hasStatus {
++			if u.firstStatus != 0 {
++				status = u.firstStatus
++			} else {
++				status = http.StatusOK
++			}
+ 			return &http.Response{
+-				StatusCode: http.StatusOK,
+-				Status:     "200 OK",
++				StatusCode: status,
++				Status:     http.StatusText(status),
+ 				Header:     make(http.Header),
+ 				Body:       io.NopCloser(strings.NewReader(u.firstBody)),
+ 			}, nil
+@@ -479,22 +484,25 @@ func TestCodexModelsFailsOverFromInvalidManifestEnvelope(t *testing.T) {
+ }
+ 
+ func TestCodexModelsDoesNotFailOverFromPermanentUpstreamStatus(t *testing.T) {
+-	statuses := []int{
+-		http.StatusBadRequest,
+-		http.StatusUnauthorized,
+-		http.StatusForbidden,
+-		600,
+-	}
+-	for _, status := range statuses {
+-		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+-			handler, upstream, groupID := newCodexModelsFailoverTestHandler(status)
++	cases := []struct {
++		statusCode int
++		wantStatus int
++	}{
++		{statusCode: http.StatusBadRequest, wantStatus: http.StatusBadRequest},
++		{statusCode: http.StatusUnauthorized, wantStatus: http.StatusUnauthorized},
++		{statusCode: http.StatusForbidden, wantStatus: http.StatusForbidden},
++		{statusCode: 600, wantStatus: http.StatusBadGateway},
++	}
++	for _, tt := range cases {
++		t.Run(fmt.Sprintf("status_%d", tt.statusCode), func(t *testing.T) {
++			handler, upstream, groupID := newCodexModelsFailoverTestHandler(tt.statusCode)
+ 			recorder := performCodexModelsRequest(t, handler, groupID)
+ 
+ 			if got, want := upstream.calls(), []int64{1}; !equalInt64Slices(got, want) {
+ 				t.Fatalf("upstream account calls: got %v, want %v", got, want)
+ 			}
+-			if recorder.Code != http.StatusBadGateway {
+-				t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
++			if recorder.Code != tt.wantStatus {
++				t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, tt.wantStatus, recorder.Body.String())
+ 			}
+ 		})
+ 	}
+@@ -524,11 +532,11 @@ func TestCodexModelsReturnsLastUpstreamErrorWhenAccountsAreExhausted(t *testing.
+ 	if got, want := upstream.calls(), []int64{1, 2}; !equalInt64Slices(got, want) {
+ 		t.Fatalf("upstream account calls: got %v, want %v", got, want)
+ 	}
+-	if recorder.Code != http.StatusBadGateway {
+-		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
++	if recorder.Code != http.StatusGatewayTimeout {
++		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusGatewayTimeout, recorder.Body.String())
+ 	}
+-	if body := recorder.Body.String(); !strings.Contains(body, "upstream error 504") {
+-		t.Fatalf("body does not preserve the last upstream error: %s", body)
++	if body := recorder.Body.String(); !strings.Contains(body, "Upstream models service timed out") {
++		t.Fatalf("body does not contain the safe last upstream error: %s", body)
+ 	}
+ }
+ 
+@@ -545,11 +553,38 @@ func TestCodexModelsHonorsAccountSwitchLimit(t *testing.T) {
+ 	if got, want := upstream.calls(), []int64{1, 2, 3}; !equalInt64Slices(got, want) {
+ 		t.Fatalf("upstream account calls: got %v, want %v", got, want)
+ 	}
+-	if recorder.Code != http.StatusBadGateway {
+-		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
++	if recorder.Code != http.StatusGatewayTimeout {
++		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusGatewayTimeout, recorder.Body.String())
++	}
++	if body := recorder.Body.String(); !strings.Contains(body, "Upstream models service timed out") {
++		t.Fatalf("body does not contain the safe limit-ending upstream error: %s", body)
+ 	}
+-	if body := recorder.Body.String(); !strings.Contains(body, "upstream error 504") {
+-		t.Fatalf("body does not preserve the limit-ending upstream error: %s", body)
++}
++
++func TestCodexModelsSanitizesUpstreamErrors(t *testing.T) {
++	cases := []struct {
++		statusCode  int
++		wantMessage string
++	}{
++		{statusCode: http.StatusUnauthorized, wantMessage: "Upstream models service authentication failed"},
++		{statusCode: http.StatusForbidden, wantMessage: "Upstream models service access denied"},
++		{statusCode: http.StatusTooManyRequests, wantMessage: "Upstream models service rate limited"},
++		{statusCode: http.StatusGatewayTimeout, wantMessage: "Upstream models service timed out"},
++		{statusCode: http.StatusServiceUnavailable, wantMessage: "Upstream models service temporarily unavailable"},
++	}
++	const secretBody = `{"error":"RAW_MARKER https://secret-upstream.example/private 203.0.113.7"}`
++	for _, tt := range cases {
++		t.Run(http.StatusText(tt.statusCode), func(t *testing.T) {
++			handler, upstream, groupID := newCodexModelsFailoverTestHandlerWithAccountCount(tt.statusCode, 1, 3)
++			upstream.firstBody = secretBody
++
++			recorder := performCodexModelsRequest(t, handler, groupID)
++			require.Equal(t, tt.statusCode, recorder.Code, recorder.Body.String())
++			require.Contains(t, recorder.Body.String(), tt.wantMessage)
++			for _, secret := range []string{"RAW_MARKER", "secret-upstream.example", "/private", "203.0.113.7"} {
++				require.NotContains(t, recorder.Body.String(), secret)
++			}
++		})
+ 	}
+ }
+ 
+diff --git a/backend/internal/service/openai_codex_models_service.go b/backend/internal/service/openai_codex_models_service.go
+index 9789e941e..4b1f837f0 100644
+--- a/backend/internal/service/openai_codex_models_service.go
++++ b/backend/internal/service/openai_codex_models_service.go
+@@ -1304,6 +1304,32 @@ func (e *codexModelsManifestUpstreamError) Error() string { return e.err.Error()
+ 
+ func (e *codexModelsManifestUpstreamError) Unwrap() error { return e.err }
+ 
++// CodexModelsManifestClientError preserves a useful upstream HTTP status while
++// ensuring the client never receives an upstream response body, endpoint, or
++// transport error detail.
++func CodexModelsManifestClientError(err error) (int, string) {
++	var upstreamErr *codexModelsManifestUpstreamError
++	if !errors.As(err, &upstreamErr) || upstreamErr.statusCode < http.StatusBadRequest || upstreamErr.statusCode >= 600 {
++		return http.StatusBadGateway, "Upstream models service request failed"
++	}
++
++	statusCode := upstreamErr.statusCode
++	switch {
++	case statusCode == http.StatusUnauthorized:
++		return statusCode, "Upstream models service authentication failed"
++	case statusCode == http.StatusForbidden:
++		return statusCode, "Upstream models service access denied"
++	case statusCode == http.StatusTooManyRequests:
++		return statusCode, "Upstream models service rate limited"
++	case statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout:
++		return statusCode, "Upstream models service timed out"
++	case statusCode >= http.StatusInternalServerError:
++		return statusCode, "Upstream models service temporarily unavailable"
++	default:
++		return statusCode, "Upstream models service request failed"
++	}
++}
++
+ // IsRetryableCodexModelsManifestError reports whether another selected account
+ // may succeed without changing the request. API key upstream 404/405 responses
+ // mean that the selected account does not expose a model-discovery endpoint, so
+diff --git a/backend/internal/service/openai_codex_models_service_test.go b/backend/internal/service/openai_codex_models_service_test.go
+index 68fc2c788..877d7561c 100644
+--- a/backend/internal/service/openai_codex_models_service_test.go
++++ b/backend/internal/service/openai_codex_models_service_test.go
+@@ -1505,6 +1505,39 @@ func TestIsRetryableCodexModelsManifestStatus(t *testing.T) {
+ 	}
+ }
+ 
++func TestCodexModelsManifestClientErrorSanitizesUpstreamDetails(t *testing.T) {
++	const secret = "https://secret-upstream.example/private 203.0.113.7 RAW_MARKER"
++	cases := []struct {
++		name        string
++		statusCode  int
++		wantStatus  int
++		wantMessage string
++	}{
++		{name: "unauthorized", statusCode: http.StatusUnauthorized, wantStatus: http.StatusUnauthorized, wantMessage: "Upstream models service authentication failed"},
++		{name: "forbidden", statusCode: http.StatusForbidden, wantStatus: http.StatusForbidden, wantMessage: "Upstream models service access denied"},
++		{name: "rate limited", statusCode: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests, wantMessage: "Upstream models service rate limited"},
++		{name: "request timeout", statusCode: http.StatusRequestTimeout, wantStatus: http.StatusRequestTimeout, wantMessage: "Upstream models service timed out"},
++		{name: "gateway timeout", statusCode: http.StatusGatewayTimeout, wantStatus: http.StatusGatewayTimeout, wantMessage: "Upstream models service timed out"},
++		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, wantStatus: http.StatusServiceUnavailable, wantMessage: "Upstream models service temporarily unavailable"},
++		{name: "transport", wantStatus: http.StatusBadGateway, wantMessage: "Upstream models service request failed"},
++	}
++	for _, tt := range cases {
++		t.Run(tt.name, func(t *testing.T) {
++			err := &codexModelsManifestUpstreamError{
++				err:        errors.New(secret),
++				statusCode: tt.statusCode,
++				body:       []byte(secret),
++			}
++			statusCode, message := CodexModelsManifestClientError(err)
++			require.Equal(t, tt.wantStatus, statusCode)
++			require.Equal(t, tt.wantMessage, message)
++			for _, value := range []string{"RAW_MARKER", "secret-upstream.example", "/private", "203.0.113.7"} {
++				require.NotContains(t, message, value)
++			}
++		})
++	}
++}
++
+ func newCodexModelsAPIKeyTestService(upstream HTTPUpstream) *OpenAIGatewayService {
+ 	svc := &OpenAIGatewayService{
+ 		cfg: &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{
+-- 
+2.53.0
+
