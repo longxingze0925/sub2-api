@@ -1,0 +1,204 @@
+From 475c68e3f4864210f7c9eb7d97309a9f2c77de5e Mon Sep 17 00:00:00 2001
+From: longxingze0925 <longxingze0925@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 16:43:43 +0800
+Subject: [PATCH 1/2] feat(codex): use local API key model catalog
+
+
+diff --git a/backend/internal/handler/openai_codex_models_handler_test.go b/backend/internal/handler/openai_codex_models_handler_test.go
+index aed2ba34b..bb451380e 100644
+--- a/backend/internal/handler/openai_codex_models_handler_test.go
++++ b/backend/internal/handler/openai_codex_models_handler_test.go
+@@ -157,6 +157,7 @@ func TestCodexModelsAppliesLocalFiltersBeforeClientETag(t *testing.T) {
+ 		upstream,
+ 		nil, nil, nil, nil, nil, nil, nil, nil,
+ 	)
++	gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
+ 	handler := &OpenAIGatewayHandler{gatewayService: gatewayService}
+ 	group := &service.Group{
+ 		ID:       groupID,
+@@ -226,6 +227,7 @@ func TestCodexModelsAPIKeyCacheDoesNotLeakGroupFilters(t *testing.T) {
+ 		upstream,
+ 		nil, nil, nil, nil, nil, nil, nil, nil,
+ 	)
++	gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
+ 	handler := &OpenAIGatewayHandler{gatewayService: gatewayService}
+ 	groupA := &service.Group{
+ 		ID:       91,
+@@ -360,6 +362,37 @@ func TestCodexModelsUsesConfiguredModelsBeforeUpstreamDiscovery(t *testing.T) {
+ 	}
+ }
+ 
++func TestCodexModelsAPIKeyUsesLocalCatalogWithoutUpstreamDiscovery(t *testing.T) {
++	handler, upstream, groupID := newCodexModelsFailoverTestHandler(http.StatusServiceUnavailable)
++	handler.gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(false)
++
++	first := performCodexModelsRequest(t, handler, groupID)
++	if first.Code != http.StatusOK {
++		t.Fatalf("first status: got %d, want %d; body=%s", first.Code, http.StatusOK, first.Body.String())
++	}
++	if got := upstream.calls(); len(got) != 0 {
++		t.Fatalf("upstream account calls: got %v, want none", got)
++	}
++	if slugs := codexHandlerManifestSlugs(t, first); !containsCodexModel(slugs, "gpt-5.6-sol") {
++		t.Fatalf("local default catalog is missing gpt-5.6-sol: %v", slugs)
++	}
++	etag := first.Header().Get("ETag")
++	if etag == "" {
++		t.Fatal("local catalog response did not include an ETag")
++	}
++
++	second := performCodexModelsRequestForGroup(t, handler, &service.Group{ID: groupID, Platform: service.PlatformOpenAI}, etag)
++	if second.Code != http.StatusNotModified {
++		t.Fatalf("second status: got %d, want %d; body=%s", second.Code, http.StatusNotModified, second.Body.String())
++	}
++	if second.Body.Len() != 0 {
++		t.Fatalf("second body: got %q, want empty", second.Body.String())
++	}
++	if got := upstream.calls(); len(got) != 0 {
++		t.Fatalf("upstream account calls after ETag request: got %v, want none", got)
++	}
++}
++
+ func TestCompositeCodexModelsReusesExistingManifestSelection(t *testing.T) {
+ 	handler, upstream, groupID := newCodexModelsFailoverTestHandler(http.StatusServiceUnavailable)
+ 
+@@ -552,6 +585,7 @@ func newCodexModelsFailoverTestHandlerWithAccountCount(firstStatus, accountCount
+ 		upstream,
+ 		nil, nil, nil, nil, nil, nil, nil, nil,
+ 	)
++	gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
+ 	return &OpenAIGatewayHandler{gatewayService: gatewayService, maxAccountSwitches: maxSwitches}, upstream, groupID
+ }
+ 
+@@ -640,3 +674,12 @@ func equalInt64Slices(got, want []int64) bool {
+ 	}
+ 	return true
+ }
++
++func containsCodexModel(values []string, want string) bool {
++	for _, value := range values {
++		if value == want {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/backend/internal/service/openai_codex_models_service.go b/backend/internal/service/openai_codex_models_service.go
+index 6c97eb9b8..9789e941e 100644
+--- a/backend/internal/service/openai_codex_models_service.go
++++ b/backend/internal/service/openai_codex_models_service.go
+@@ -154,6 +154,30 @@ func (s *OpenAIGatewayService) BuildGroupConfiguredCodexModelsManifest(
+ 	return manifest, true, nil
+ }
+ 
++// codexModelsManifestFallbackForAccount builds the API key model catalog from
++// the public names configured on the selected account. Accounts without an
++// explicit mapping retain the local OpenAI default catalog so Codex clients do
++// not need an upstream /models implementation merely to populate their picker.
++func codexModelsManifestFallbackForAccount(account *Account) (*CodexModelsManifest, error) {
++	if account == nil {
++		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_CODEX_MODELS_ACCOUNT_REQUIRED", "account is required")
++	}
++
++	modelIDs := openAIConfiguredCodexModelIDs([]Account{*account})
++	if len(modelIDs) == 0 {
++		modelIDs = openai.DefaultModelIDs()
++	}
++	modelIDs = FilterCodexModelIDsForGroup(modelIDs, nil)
++	body, err := BuildCodexModelsManifest(modelIDs)
++	if err != nil {
++		return nil, fmt.Errorf("build local API key Codex models manifest: %w", err)
++	}
++	return &CodexModelsManifest{
++		Body: body,
++		ETag: codexModelsManifestBodyETag(body),
++	}, nil
++}
++
+ // MergeGroupConfiguredCodexModels adds account model aliases that are visible
+ // to the authenticated OpenAI group without discarding metadata from upstream
+ // Codex model entries. A group's custom models list also filters the picker,
+@@ -1477,6 +1501,9 @@ func (s *OpenAIGatewayService) FetchCodexModelsManifest(ctx context.Context, acc
+ 	if err != nil {
+ 		return nil, infraerrors.Newf(http.StatusInternalServerError, "OPENAI_CODEX_MODELS_CREDENTIALS_FAILED", "resolve credential account: %v", err)
+ 	}
++	if credAccount.IsOpenAIApiKey() && !s.allowAPIKeyCodexModelsUpstream {
++		return codexModelsManifestFallbackForAccount(account)
++	}
+ 
+ 	clientVersion = strings.TrimSpace(clientVersion)
+ 	if clientVersion == "" {
+diff --git a/backend/internal/service/openai_codex_models_service_test.go b/backend/internal/service/openai_codex_models_service_test.go
+index 49b5f4e46..68fc2c788 100644
+--- a/backend/internal/service/openai_codex_models_service_test.go
++++ b/backend/internal/service/openai_codex_models_service_test.go
+@@ -1506,12 +1506,36 @@ func TestIsRetryableCodexModelsManifestStatus(t *testing.T) {
+ }
+ 
+ func newCodexModelsAPIKeyTestService(upstream HTTPUpstream) *OpenAIGatewayService {
+-	return &OpenAIGatewayService{
++	svc := &OpenAIGatewayService{
+ 		cfg: &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{
+ 			Enabled: false,
+ 		}}},
+ 		httpUpstream: upstream,
+ 	}
++	svc.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
++	return svc
++}
++
++func TestFetchCodexModelsManifestAPIKeyUsesLocalFallbackByDefault(t *testing.T) {
++	t.Parallel()
++
++	var calls atomic.Int32
++	svc := &OpenAIGatewayService{
++		httpUpstream: &codexModelsHTTPUpstreamStub{do: func(_ *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
++			calls.Add(1)
++			return nil, errors.New("upstream must not be called")
++		}},
++	}
++	account := newCodexModelsAPIKeyTestAccount("https://upstream.example/v1")
++	account.Credentials["model_mapping"] = map[string]any{
++		"custom-codex": "upstream-custom-codex",
++	}
++
++	manifest, err := svc.FetchCodexModelsManifest(context.Background(), account, "0.144.0", "")
++	require.NoError(t, err)
++	require.Equal(t, int32(0), calls.Load())
++	require.Equal(t, []string{"custom-codex"}, codexManifestModelSlugs(t, manifest.Body))
++	require.NotEmpty(t, manifest.ETag)
+ }
+ 
+ func newCodexModelsAPIKeyTestAccount(baseURL string) *Account {
+diff --git a/backend/internal/service/openai_gateway_service.go b/backend/internal/service/openai_gateway_service.go
+index aaa2e30af..b6014f2b1 100644
+--- a/backend/internal/service/openai_gateway_service.go
++++ b/backend/internal/service/openai_gateway_service.go
+@@ -482,6 +482,7 @@ type OpenAIGatewayService struct {
+ 	responseHeaderFilter                *responseheaders.CompiledHeaderFilter
+ 	codexSnapshotThrottle               *accountWriteThrottle
+ 	codexModelsManifestCache            codexModelsManifestCache
++	allowAPIKeyCodexModelsUpstream      bool
+ 	openaiCompatSessionResponses        sync.Map
+ 	openaiCompatAnthropicDigestSessions sync.Map
+ 	// openaiCodexTurnStateOrigins: 下游会话 seed → openAICodexTurnStateOrigin，
+@@ -569,6 +570,16 @@ func NewOpenAIGatewayService(
+ 	return svc
+ }
+ 
++// SetAPIKeyCodexModelsUpstreamCompatibilityForTesting temporarily restores
++// upstream model discovery for API key accounts. Production code intentionally
++// leaves this disabled so a Codex model-list refresh does not depend on an
++// upstream /models endpoint.
++func (s *OpenAIGatewayService) SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(enabled bool) {
++	if s != nil {
++		s.allowAPIKeyCodexModelsUpstream = enabled
++	}
++}
++
+ // ResolveChannelMapping 解析渠道级模型映射（代理到 ChannelService）
+ func (s *OpenAIGatewayService) ResolveChannelMapping(ctx context.Context, groupID int64, model string) ChannelMappingResult {
+ 	if s.channelService == nil {
+-- 
+2.53.0
+
