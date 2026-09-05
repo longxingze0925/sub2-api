@@ -6,7 +6,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -104,7 +103,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 				return
 			}
 			if lastUpstreamErr != nil {
-				h.errorResponse(c, infraerrors.Code(lastUpstreamErr), "upstream_error", infraerrors.Message(lastUpstreamErr))
+				h.codexModelsUpstreamErrorResponse(c, lastUpstreamErr)
 				return
 			}
 			h.errorResponse(c, http.StatusServiceUnavailable, "upstream_error", "No available OpenAI accounts")
@@ -126,7 +125,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 				lastUpstreamErr = err
 				continue
 			}
-			h.errorResponse(c, infraerrors.Code(err), "upstream_error", infraerrors.Message(err))
+			h.codexModelsUpstreamErrorResponse(c, err)
 			return
 		}
 		if err := h.gatewayService.CompleteAPIKeyCodexModelsManifestForClient(manifest, account); err != nil {
@@ -144,6 +143,11 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 		writeCodexModelsManifestResponse(c, manifest)
 		return
 	}
+}
+
+func (h *OpenAIGatewayHandler) codexModelsUpstreamErrorResponse(c *gin.Context, err error) {
+	statusCode, message := service.CodexModelsManifestClientError(err)
+	h.errorResponse(c, statusCode, "upstream_error", message)
 }
 
 func writeCodexModelsManifestResponse(c *gin.Context, manifest *service.CodexModelsManifest) {
