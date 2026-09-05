@@ -482,6 +482,7 @@ type OpenAIGatewayService struct {
 	responseHeaderFilter                *responseheaders.CompiledHeaderFilter
 	codexSnapshotThrottle               *accountWriteThrottle
 	codexModelsManifestCache            codexModelsManifestCache
+	allowAPIKeyCodexModelsUpstream      bool
 	openaiCompatSessionResponses        sync.Map
 	openaiCompatAnthropicDigestSessions sync.Map
 	// openaiCodexTurnStateOrigins: 下游会话 seed → openAICodexTurnStateOrigin，
@@ -567,6 +568,16 @@ func NewOpenAIGatewayService(
 	}
 	svc.logOpenAIWSModeBootstrap()
 	return svc
+}
+
+// SetAPIKeyCodexModelsUpstreamCompatibilityForTesting temporarily restores
+// upstream model discovery for API key accounts. Production code intentionally
+// leaves this disabled so a Codex model-list refresh does not depend on an
+// upstream /models endpoint.
+func (s *OpenAIGatewayService) SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(enabled bool) {
+	if s != nil {
+		s.allowAPIKeyCodexModelsUpstream = enabled
+	}
 }
 
 // ResolveChannelMapping 解析渠道级模型映射（代理到 ChannelService）

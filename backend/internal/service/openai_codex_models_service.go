@@ -154,6 +154,30 @@ func (s *OpenAIGatewayService) BuildGroupConfiguredCodexModelsManifest(
 	return manifest, true, nil
 }
 
+// codexModelsManifestFallbackForAccount builds the API key model catalog from
+// the public names configured on the selected account. Accounts without an
+// explicit mapping retain the local OpenAI default catalog so Codex clients do
+// not need an upstream /models implementation merely to populate their picker.
+func codexModelsManifestFallbackForAccount(account *Account) (*CodexModelsManifest, error) {
+	if account == nil {
+		return nil, infraerrors.New(http.StatusInternalServerError, "OPENAI_CODEX_MODELS_ACCOUNT_REQUIRED", "account is required")
+	}
+
+	modelIDs := openAIConfiguredCodexModelIDs([]Account{*account})
+	if len(modelIDs) == 0 {
+		modelIDs = openai.DefaultModelIDs()
+	}
+	modelIDs = FilterCodexModelIDsForGroup(modelIDs, nil)
+	body, err := BuildCodexModelsManifest(modelIDs)
+	if err != nil {
+		return nil, fmt.Errorf("build local API key Codex models manifest: %w", err)
+	}
+	return &CodexModelsManifest{
+		Body: body,
+		ETag: codexModelsManifestBodyETag(body),
+	}, nil
+}
+
 // MergeGroupConfiguredCodexModels adds account model aliases that are visible
 // to the authenticated OpenAI group without discarding metadata from upstream
 // Codex model entries. A group's custom models list also filters the picker,
@@ -1476,6 +1500,9 @@ func (s *OpenAIGatewayService) FetchCodexModelsManifest(ctx context.Context, acc
 	credAccount, err := resolveCredentialAccount(ctx, s.accountRepo, account)
 	if err != nil {
 		return nil, infraerrors.Newf(http.StatusInternalServerError, "OPENAI_CODEX_MODELS_CREDENTIALS_FAILED", "resolve credential account: %v", err)
+	}
+	if credAccount.IsOpenAIApiKey() && !s.allowAPIKeyCodexModelsUpstream {
+		return codexModelsManifestFallbackForAccount(account)
 	}
 
 	clientVersion = strings.TrimSpace(clientVersion)

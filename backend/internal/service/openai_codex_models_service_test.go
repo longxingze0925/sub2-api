@@ -1506,12 +1506,36 @@ func TestIsRetryableCodexModelsManifestStatus(t *testing.T) {
 }
 
 func newCodexModelsAPIKeyTestService(upstream HTTPUpstream) *OpenAIGatewayService {
-	return &OpenAIGatewayService{
+	svc := &OpenAIGatewayService{
 		cfg: &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{
 			Enabled: false,
 		}}},
 		httpUpstream: upstream,
 	}
+	svc.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
+	return svc
+}
+
+func TestFetchCodexModelsManifestAPIKeyUsesLocalFallbackByDefault(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	svc := &OpenAIGatewayService{
+		httpUpstream: &codexModelsHTTPUpstreamStub{do: func(_ *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+			calls.Add(1)
+			return nil, errors.New("upstream must not be called")
+		}},
+	}
+	account := newCodexModelsAPIKeyTestAccount("https://upstream.example/v1")
+	account.Credentials["model_mapping"] = map[string]any{
+		"custom-codex": "upstream-custom-codex",
+	}
+
+	manifest, err := svc.FetchCodexModelsManifest(context.Background(), account, "0.144.0", "")
+	require.NoError(t, err)
+	require.Equal(t, int32(0), calls.Load())
+	require.Equal(t, []string{"custom-codex"}, codexManifestModelSlugs(t, manifest.Body))
+	require.NotEmpty(t, manifest.ETag)
 }
 
 func newCodexModelsAPIKeyTestAccount(baseURL string) *Account {

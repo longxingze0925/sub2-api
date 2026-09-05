@@ -157,6 +157,7 @@ func TestCodexModelsAppliesLocalFiltersBeforeClientETag(t *testing.T) {
 		upstream,
 		nil, nil, nil, nil, nil, nil, nil, nil,
 	)
+	gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
 	handler := &OpenAIGatewayHandler{gatewayService: gatewayService}
 	group := &service.Group{
 		ID:       groupID,
@@ -226,6 +227,7 @@ func TestCodexModelsAPIKeyCacheDoesNotLeakGroupFilters(t *testing.T) {
 		upstream,
 		nil, nil, nil, nil, nil, nil, nil, nil,
 	)
+	gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
 	handler := &OpenAIGatewayHandler{gatewayService: gatewayService}
 	groupA := &service.Group{
 		ID:       91,
@@ -357,6 +359,37 @@ func TestCodexModelsUsesConfiguredModelsBeforeUpstreamDiscovery(t *testing.T) {
 	}
 	if _, ok := envelope.Models[0]["supported_reasoning_levels"]; !ok {
 		t.Fatalf("configured model is missing the Codex descriptor contract: %v", envelope.Models[0])
+	}
+}
+
+func TestCodexModelsAPIKeyUsesLocalCatalogWithoutUpstreamDiscovery(t *testing.T) {
+	handler, upstream, groupID := newCodexModelsFailoverTestHandler(http.StatusServiceUnavailable)
+	handler.gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(false)
+
+	first := performCodexModelsRequest(t, handler, groupID)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status: got %d, want %d; body=%s", first.Code, http.StatusOK, first.Body.String())
+	}
+	if got := upstream.calls(); len(got) != 0 {
+		t.Fatalf("upstream account calls: got %v, want none", got)
+	}
+	if slugs := codexHandlerManifestSlugs(t, first); !containsCodexModel(slugs, "gpt-5.6-sol") {
+		t.Fatalf("local default catalog is missing gpt-5.6-sol: %v", slugs)
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("local catalog response did not include an ETag")
+	}
+
+	second := performCodexModelsRequestForGroup(t, handler, &service.Group{ID: groupID, Platform: service.PlatformOpenAI}, etag)
+	if second.Code != http.StatusNotModified {
+		t.Fatalf("second status: got %d, want %d; body=%s", second.Code, http.StatusNotModified, second.Body.String())
+	}
+	if second.Body.Len() != 0 {
+		t.Fatalf("second body: got %q, want empty", second.Body.String())
+	}
+	if got := upstream.calls(); len(got) != 0 {
+		t.Fatalf("upstream account calls after ETag request: got %v, want none", got)
 	}
 }
 
@@ -552,6 +585,7 @@ func newCodexModelsFailoverTestHandlerWithAccountCount(firstStatus, accountCount
 		upstream,
 		nil, nil, nil, nil, nil, nil, nil, nil,
 	)
+	gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
 	return &OpenAIGatewayHandler{gatewayService: gatewayService, maxAccountSwitches: maxSwitches}, upstream, groupID
 }
 
@@ -639,4 +673,13 @@ func equalInt64Slices(got, want []int64) bool {
 		}
 	}
 	return true
+}
+
+func containsCodexModel(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
