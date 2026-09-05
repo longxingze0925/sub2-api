@@ -1505,6 +1505,39 @@ func TestIsRetryableCodexModelsManifestStatus(t *testing.T) {
 	}
 }
 
+func TestCodexModelsManifestClientErrorSanitizesUpstreamDetails(t *testing.T) {
+	const secret = "https://secret-upstream.example/private 203.0.113.7 RAW_MARKER"
+	cases := []struct {
+		name        string
+		statusCode  int
+		wantStatus  int
+		wantMessage string
+	}{
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, wantStatus: http.StatusUnauthorized, wantMessage: "Upstream models service authentication failed"},
+		{name: "forbidden", statusCode: http.StatusForbidden, wantStatus: http.StatusForbidden, wantMessage: "Upstream models service access denied"},
+		{name: "rate limited", statusCode: http.StatusTooManyRequests, wantStatus: http.StatusTooManyRequests, wantMessage: "Upstream models service rate limited"},
+		{name: "request timeout", statusCode: http.StatusRequestTimeout, wantStatus: http.StatusRequestTimeout, wantMessage: "Upstream models service timed out"},
+		{name: "gateway timeout", statusCode: http.StatusGatewayTimeout, wantStatus: http.StatusGatewayTimeout, wantMessage: "Upstream models service timed out"},
+		{name: "service unavailable", statusCode: http.StatusServiceUnavailable, wantStatus: http.StatusServiceUnavailable, wantMessage: "Upstream models service temporarily unavailable"},
+		{name: "transport", wantStatus: http.StatusBadGateway, wantMessage: "Upstream models service request failed"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &codexModelsManifestUpstreamError{
+				err:        errors.New(secret),
+				statusCode: tt.statusCode,
+				body:       []byte(secret),
+			}
+			statusCode, message := CodexModelsManifestClientError(err)
+			require.Equal(t, tt.wantStatus, statusCode)
+			require.Equal(t, tt.wantMessage, message)
+			for _, value := range []string{"RAW_MARKER", "secret-upstream.example", "/private", "203.0.113.7"} {
+				require.NotContains(t, message, value)
+			}
+		})
+	}
+}
+
 func newCodexModelsAPIKeyTestService(upstream HTTPUpstream) *OpenAIGatewayService {
 	svc := &OpenAIGatewayService{
 		cfg: &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{

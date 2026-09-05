@@ -1304,6 +1304,32 @@ func (e *codexModelsManifestUpstreamError) Error() string { return e.err.Error()
 
 func (e *codexModelsManifestUpstreamError) Unwrap() error { return e.err }
 
+// CodexModelsManifestClientError preserves a useful upstream HTTP status while
+// ensuring the client never receives an upstream response body, endpoint, or
+// transport error detail.
+func CodexModelsManifestClientError(err error) (int, string) {
+	var upstreamErr *codexModelsManifestUpstreamError
+	if !errors.As(err, &upstreamErr) || upstreamErr.statusCode < http.StatusBadRequest || upstreamErr.statusCode >= 600 {
+		return http.StatusBadGateway, "Upstream models service request failed"
+	}
+
+	statusCode := upstreamErr.statusCode
+	switch {
+	case statusCode == http.StatusUnauthorized:
+		return statusCode, "Upstream models service authentication failed"
+	case statusCode == http.StatusForbidden:
+		return statusCode, "Upstream models service access denied"
+	case statusCode == http.StatusTooManyRequests:
+		return statusCode, "Upstream models service rate limited"
+	case statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout:
+		return statusCode, "Upstream models service timed out"
+	case statusCode >= http.StatusInternalServerError:
+		return statusCode, "Upstream models service temporarily unavailable"
+	default:
+		return statusCode, "Upstream models service request failed"
+	}
+}
+
 // IsRetryableCodexModelsManifestError reports whether another selected account
 // may succeed without changing the request. API key upstream 404/405 responses
 // mean that the selected account does not expose a model-discovery endpoint, so
