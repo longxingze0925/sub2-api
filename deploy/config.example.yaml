@@ -1074,7 +1074,7 @@ pricing:
   # 覆盖补丁文件（可选，优先级最高）：条目按字段浅合并覆盖目录/回退数据，
   # 字段值为 null 表示删除该字段。模型名须与目录键完全一致。
   # 修改后在下一次哈希检查时按内容哈希自动重载，无需重启。
-  # override_file: "./data/model_pricing_overrides.json"
+  override_file: "./resources/model-pricing/model_pricing_overrides.json"
   # Update interval in hours
   # 更新间隔（小时）
   update_interval_hours: 24

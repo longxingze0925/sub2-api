@@ -199,3 +199,27 @@ func TestPricingOverride_DisablesGPT55LadderOnDefaultCatalog(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 272000, pricing.LongContextInputThreshold, "其他模型的目录阶梯不受影响")
 }
+
+func TestTerraPricingOverridePinsUpstreamRates(t *testing.T) {
+	overridePath := filepath.Join("..", "..", "resources", "model-pricing", "model_pricing_overrides.json")
+	basePath := filepath.Join("..", "..", "resources", "model-pricing", "model_prices_and_context_window.json")
+
+	svc := &PricingService{cfg: &config.Config{}}
+	svc.cfg.Pricing.OverrideFile = overridePath
+	body, err := os.ReadFile(basePath)
+	require.NoError(t, err)
+
+	data, err := svc.parsePricingData(body)
+	require.NoError(t, err)
+	terra := data["gpt-5.6-terra"]
+	require.NotNil(t, terra)
+	require.InDelta(t, 2.5e-6, terra.InputCostPerToken, 1e-15)
+	require.InDelta(t, 5e-6, terra.InputCostPerTokenPriority, 1e-15)
+	require.InDelta(t, 15e-6, terra.OutputCostPerToken, 1e-15)
+	require.InDelta(t, 30e-6, terra.OutputCostPerTokenPriority, 1e-15)
+	require.InDelta(t, 0.25e-6, terra.CacheReadInputTokenCost, 1e-15)
+	require.InDelta(t, 0.5e-6, terra.CacheReadInputTokenCostPriority, 1e-15)
+	require.Equal(t, 272000, terra.LongContextInputTokenThreshold)
+	require.InDelta(t, 2.0, terra.LongContextInputCostMultiplier, 1e-15)
+	require.InDelta(t, 1.5, terra.LongContextOutputCostMultiplier, 1e-15)
+}

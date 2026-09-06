@@ -80,9 +80,14 @@ func (u *codexModelsFailoverHTTPUpstream) Do(_ *http.Request, _ string, accountI
 			return nil, u.firstErr
 		}
 		if u.firstBody != "" && !hasStatus {
+			if u.firstStatus != 0 {
+				status = u.firstStatus
+			} else {
+				status = http.StatusOK
+			}
 			return &http.Response{
-				StatusCode: http.StatusOK,
-				Status:     "200 OK",
+				StatusCode: status,
+				Status:     http.StatusText(status),
 				Header:     make(http.Header),
 				Body:       io.NopCloser(strings.NewReader(u.firstBody)),
 			}, nil
@@ -481,22 +486,25 @@ func TestCodexModelsFailsOverFromInvalidManifestEnvelope(t *testing.T) {
 }
 
 func TestCodexModelsDoesNotFailOverFromPermanentUpstreamStatus(t *testing.T) {
-	statuses := []int{
-		http.StatusBadRequest,
-		http.StatusUnauthorized,
-		http.StatusForbidden,
-		600,
+	cases := []struct {
+		statusCode int
+		wantStatus int
+	}{
+		{statusCode: http.StatusBadRequest, wantStatus: http.StatusBadRequest},
+		{statusCode: http.StatusUnauthorized, wantStatus: http.StatusUnauthorized},
+		{statusCode: http.StatusForbidden, wantStatus: http.StatusForbidden},
+		{statusCode: 600, wantStatus: http.StatusBadGateway},
 	}
-	for _, status := range statuses {
-		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
-			handler, upstream, groupID := newCodexModelsFailoverTestHandler(status)
+	for _, tt := range cases {
+		t.Run(fmt.Sprintf("status_%d", tt.statusCode), func(t *testing.T) {
+			handler, upstream, groupID := newCodexModelsFailoverTestHandler(tt.statusCode)
 			recorder := performCodexModelsRequest(t, handler, groupID)
 
 			if got, want := upstream.calls(), []int64{1}; !equalInt64Slices(got, want) {
 				t.Fatalf("upstream account calls: got %v, want %v", got, want)
 			}
-			if recorder.Code != http.StatusBadGateway {
-				t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, tt.wantStatus, recorder.Body.String())
 			}
 		})
 	}
@@ -526,11 +534,11 @@ func TestCodexModelsReturnsLastUpstreamErrorWhenAccountsAreExhausted(t *testing.
 	if got, want := upstream.calls(), []int64{1, 2}; !equalInt64Slices(got, want) {
 		t.Fatalf("upstream account calls: got %v, want %v", got, want)
 	}
-	if recorder.Code != http.StatusBadGateway {
-		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusGatewayTimeout, recorder.Body.String())
 	}
-	if body := recorder.Body.String(); !strings.Contains(body, "upstream error 504") {
-		t.Fatalf("body does not preserve the last upstream error: %s", body)
+	if body := recorder.Body.String(); !strings.Contains(body, "Upstream models service timed out") {
+		t.Fatalf("body does not contain the safe last upstream error: %s", body)
 	}
 }
 
@@ -547,11 +555,38 @@ func TestCodexModelsHonorsAccountSwitchLimit(t *testing.T) {
 	if got, want := upstream.calls(), []int64{1, 2, 3}; !equalInt64Slices(got, want) {
 		t.Fatalf("upstream account calls: got %v, want %v", got, want)
 	}
-	if recorder.Code != http.StatusBadGateway {
-		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status: got %d, want %d; body=%s", recorder.Code, http.StatusGatewayTimeout, recorder.Body.String())
 	}
-	if body := recorder.Body.String(); !strings.Contains(body, "upstream error 504") {
-		t.Fatalf("body does not preserve the limit-ending upstream error: %s", body)
+	if body := recorder.Body.String(); !strings.Contains(body, "Upstream models service timed out") {
+		t.Fatalf("body does not contain the safe limit-ending upstream error: %s", body)
+	}
+}
+
+func TestCodexModelsSanitizesUpstreamErrors(t *testing.T) {
+	cases := []struct {
+		statusCode  int
+		wantMessage string
+	}{
+		{statusCode: http.StatusUnauthorized, wantMessage: "Upstream models service authentication failed"},
+		{statusCode: http.StatusForbidden, wantMessage: "Upstream models service access denied"},
+		{statusCode: http.StatusTooManyRequests, wantMessage: "Upstream models service rate limited"},
+		{statusCode: http.StatusGatewayTimeout, wantMessage: "Upstream models service timed out"},
+		{statusCode: http.StatusServiceUnavailable, wantMessage: "Upstream models service temporarily unavailable"},
+	}
+	const secretBody = `{"error":"RAW_MARKER https://secret-upstream.example/private 203.0.113.7"}`
+	for _, tt := range cases {
+		t.Run(http.StatusText(tt.statusCode), func(t *testing.T) {
+			handler, upstream, groupID := newCodexModelsFailoverTestHandlerWithAccountCount(tt.statusCode, 1, 3)
+			upstream.firstBody = secretBody
+
+			recorder := performCodexModelsRequest(t, handler, groupID)
+			require.Equal(t, tt.statusCode, recorder.Code, recorder.Body.String())
+			require.Contains(t, recorder.Body.String(), tt.wantMessage)
+			for _, secret := range []string{"RAW_MARKER", "secret-upstream.example", "/private", "203.0.113.7"} {
+				require.NotContains(t, recorder.Body.String(), secret)
+			}
+		})
 	}
 }
 
@@ -760,6 +795,7 @@ func newPinnedCodexTestHandler(accounts []service.Account, upstream *codexModels
 		upstream,
 		nil, nil, nil, nil, nil, nil, nil, nil,
 	)
+	gatewayService.SetAPIKeyCodexModelsUpstreamCompatibilityForTesting(true)
 	return &OpenAIGatewayHandler{gatewayService: gatewayService, maxAccountSwitches: maxSwitches}
 }
 
